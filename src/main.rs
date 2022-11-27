@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
-use std::{collections::{HashMap}, thread::Thread, net::UdpSocket};
-
+use std::{collections::{HashMap}, thread::{Thread, yield_now}, net::UdpSocket};
+use futures::{select, FutureExt, pin_mut, executor::block_on};
 
 mod primitives;
 use primitives::position3::Position3;
@@ -77,7 +77,6 @@ impl ThreadMap {
     }
 }
 
-
 fn main() {
     // Chunk constants
     // const CHUNK_AXIS_SIZE: u64 = 32;
@@ -88,5 +87,5 @@ fn main() {
     start_udp_server();
     //accept_connections();
 
-    println!("Hello, world!");
+    println!("Program finished.");
 }

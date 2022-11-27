@@ -1,6 +1,5 @@
 use core::{time, panic};
-use std::{net::UdpSocket, thread, time::Duration, cmp::min, sync::{Condvar, Arc, Mutex}, clone};
-use futures::{select, FutureExt, pin_mut, executor::block_on};
+use std::{net::UdpSocket, thread, time::Duration, sync::{Arc, Mutex}};
 
 struct Packet{
     payload: [u8; 1024],
@@ -41,61 +40,41 @@ impl<const N: usize> RingPacketStorage<N> {
 
 }
 
-pub async fn wait_for_cond(pair: &Arc<(Mutex<bool>, Condvar)>){
-    println!("Waiting for conditional.");
-    let (run_mutex, cvar) = &**pair;
-    let mut run = run_mutex.lock().unwrap();
-    while *run {
-        run = cvar.wait(run).unwrap();
-    }
-}
-
-pub async fn recv_udp(socket: &UdpSocket) -> (usize, [u8; 1024]) {
-    println!("Waiting for receive.");
-    let mut buffer = [0; 1024];
-    let (size, src) = socket.recv_from(&mut buffer).unwrap();
-    return (size, buffer)
-}
-
 pub fn start_udp_server(){
     let (receive_in, receive_out) = std::sync::mpsc::channel();
     let (send_in, send_out) = std::sync::mpsc::channel();
 
-    let pair = Arc::new((Mutex::new(true), Condvar::new()));
-    let clone_pair = Arc::clone(&pair);
+    let kill_recv = Arc::new(Mutex::new(false));
+    let kill_recv_copy = kill_recv.clone();
 
     // UDP Receiver
-    let handle_receiver = std::thread::spawn(move || block_on(async {
-        let clone_pair_in = clone_pair;
-
+    let handle_receiver = std::thread::spawn(move || {
         let socket = UdpSocket::bind("127.0.0.1:7878").unwrap();
-        let receiver = Mutex::new(receive_in);
-        let mut in_run = true;
+        socket.set_read_timeout(Some(Duration::new(1, 0))).unwrap();
 
-        while in_run {
-            let signal = wait_for_cond(&clone_pair_in).fuse();
-            let packet = recv_udp(&socket).fuse();
-
-            pin_mut!(signal, packet);
-
-            println!("Select started:");
-            select! {
-                () = signal => {
-                    print!("Receiver thread signaled for exit.");
-                    in_run = false;
-                },
-                (size, buffer) = packet => {
+        loop {
+            let mut buffer = [0; 1024];
+            
+            match socket.recv_from(&mut buffer) {
+                Ok((size, src)) =>  {
                     println!("THREAD: Received: {:#?}", std::str::from_utf8(&buffer[..size]).unwrap());
-                    
-                    let receiver = receiver.lock().unwrap();
-                    receiver.send(Packet{payload: buffer, true_size: size}).unwrap();
+                    receive_in.send(Packet{payload: buffer, true_size: size}).unwrap();
                 },
-            }
-
-            //let mut buffer = [0; 1024];
-            //let (size, src) = socket.recv_from(&mut buffer).unwrap();
+                Err(e) => {
+                    match e.kind() {
+                        std::io::ErrorKind::TimedOut => {
+                            let kill = kill_recv_copy.lock().unwrap();
+                            if *kill {
+                                println!("UDP receiver thread shutting down.");
+                                break;
+                            }
+                        },
+                        _ => panic!()
+                    }
+                }
+            };
         }
-    }));
+    });
 
     // UDP Sender
     let handle_sender = std::thread::spawn(move ||{
@@ -111,13 +90,14 @@ pub fn start_udp_server(){
                 },
                 Err(_) => {
                     println!("Shutting down UDP sending server.");
+                    break;
                 }
             };
 
         }
     });
 
-    let run: bool = true;
+    let mut run: bool = true;
     while run {
         thread::sleep(time::Duration::from_millis(1000));   
         println!("Sleep...");
@@ -130,18 +110,17 @@ pub fn start_udp_server(){
                     let rec_str = std::str::from_utf8(&packet.payload[..packet.true_size]).unwrap();
                     println!("Received: {:#?}", rec_str);
 
-                    if rec_str.eq("shutdown") {
+                    if rec_str.eq("shutdown\n\n") {
                         println!("Shutting down receiver from main thread.");
-                        let (run_mutex, cvar) = &*pair;
 
-                        let mut value = run_mutex.lock().unwrap();
-                        *value = false;
-                        cvar.notify_one();
+                        let mut value = kill_recv.lock().unwrap();
+                        *value = true;
+                        run = false;
+                    }else{
+                        let send_string = format!("Hello {:#?}", rec_str);
+                        send_in.send(Packet::from_str(&send_string)).unwrap();
+                        println!("Sent: {:#?}", send_string);
                     }
-
-                    let send_string = format!("Hello {:#?}", rec_str);
-                    send_in.send(Packet::from_str(&send_string)).unwrap();
-                    println!("Sent: {:#?}", send_string);
                 },
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     next = false;
@@ -150,6 +129,8 @@ pub fn start_udp_server(){
             };
         }
     }
+
+    drop(send_in);
 
     handle_receiver.join().unwrap();
     handle_sender.join().unwrap();
